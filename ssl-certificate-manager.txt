@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+import boto3
+import OpenSSL
+import datetime
+import asyncio
+import aiodns
+import logging
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
+@dataclass
+class CertificateConfiguration:
+    domain: str
+    organization: str
+    country: str = "US"
+    state: str = "California"
+    locality: str = "San Francisco"
+    organizational_unit: str = "KaleidoscopeAI Platform"
+    email: str = "admin@kaleidoscope.ai"
+    key_size: int = 2048
+    validity_days: int = 365
+
+class SSLCertificateManager:
+    def __init__(self, region: str = "us-east-2"):
+        self.region = region
+        self.session = boto3.Session(region_name=region)
+        self.acm = self.session.client('acm')
+        self.route53 = self.session.client('route53')
+        self.secrets = self.session.client('secretsmanager')
+        self.resolver = aiodns.DNSResolver()
+        self.logger = self._setup_logger()
+
+    def _setup_logger(self):
+        logger = logging.getLogger('SSLCertificateManager')
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(handler)
+        return logger
+
+    async def generate_certificate(self, config: CertificateConfiguration) -> Tuple[str, str]:
+        # Generate key pair
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=config.key_size
+        )
+
+        # Generate CSR
+        csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, config.domain),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.organization),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.organizational_unit),
+            x509.NameAttribute(NameOID.COUNTRY_NAME, config.country),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, config.state),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, config.locality),
+            x509.NameAttribute(NameOID.EMAIL_ADDRESS, config.email)
+        ])).add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(config.domain),
+                x509.DNSName(f"*.{config.domain}")
+            ]),
+            critical=False
+        ).sign(private_key, hashes.SHA256())
+
+        # Serialize key and CSR
+        private_key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode('utf-8')
+
+        csr_pem = csr.public_bytes(
+            encoding=serialization.Encoding.PEM
+        ).decode('utf-8')
+
+        return private_key_pem, csr_pem
+
+    async def request_acm_certificate(self, config: CertificateConfiguration) -> str:
+        try:
+            # Request certificate
+            response = self.acm.request_certificate(
+                DomainName=config.domain,
+                ValidationMethod='DNS',
+                SubjectAlternativeNames=[f"*.{config.domain}"],
+                Tags=[
+                    {
+                        'Key': 'Environment',
+                        'Value': 'Production'
+                    },
+                    {
+                        'Key': 'Platform',
+                        'Value': 'KaleidoscopeAI'
+                    }
+                ]
+            )
+            cert_arn = response['CertificateArn']
+            self.logger.info(f"Requested ACM certificate: {cert_arn}")
+
+            # Wait for validation records
+            validation_records = await self._get_validation_records(cert_arn)
+            await self._create_validation_records(validation_records)
+            await self._verify_certificate(cert_arn)
+
+            return cert_arn
+
+        except Exception as e:
+            self.logger.error(f"Failed to request ACM certificate: {e}")
+            raise
+
+    async def _get_validation_records(self, cert_arn: str) -> List[dict]:
+        max_attempts = 30
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                cert_details = self.acm.describe_certificate(CertificateArn=cert_arn)
+                validation_options = cert_details['Certificate']['DomainValidationOptions']
+                if all(opt.get('ResourceRecord') for opt in validation_options):
+                    return [opt['ResourceRecord'] for opt in validation_options]
+            except Exception as e:
+                self.logger.warning(f"Waiting for validation records: {e}")
+            attempt += 1
+            await asyncio.sleep(10)
+        raise Exception("Timeout waiting for validation records")
+
+    async def _create_validation_records(self, validation_records: List[dict]):
+        try:
+            zones = self.route53.list_hosted_zones()['HostedZones']
+            for record in validation_records:
+                zone_id = next(
+                    zone['Id'] for zone in zones 
+                    if record['Name'].endswith(zone['Name'].rstrip('.'))
+                )
+                
+                self.route53.change_resource_record_sets(
+                    HostedZoneId=zone_id,
+                    ChangeBatch={
+                        'Changes': [{
+                            'Action': 'UPSERT',
+                            'ResourceRecordSet': {
+                                'Name': record['Name'],
+                                'Type': record['Type'],
+                                'TTL': 300,
+                                'ResourceRecords': [{'Value': record['Value']}]
+                            }
+                        }]
+                    }
+                )
+                self.logger.info(f"Created validation

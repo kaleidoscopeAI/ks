@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+# Execute Python script with appropriate error handling
+python3 run_automation.py 2>&1 | tee automation.log
+
+# Check exit status
+if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    echo "Domain automation completed successfully"
+else
+    echo "Domain automation failed. Check automation.log for details"
+    exit 1
+fi

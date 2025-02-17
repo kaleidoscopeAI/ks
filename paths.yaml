@@ -1,0 +1,5 @@
+model_cache: 'models/'
+data_dir: 'data/'
+log_dir: 'logs/'
+results_dir: 'results/'
+visualization_dir: 'results/visualizations/'

@@ -1,0 +1,96 @@
+ go daddy api: Environment	Name	Key	Created	Actions
+OTE	artificialthinker.com	3mM44Ywf1677ab_Hx1wV7Hy6JjiXcPeGiRQzL	8 days ago	
+Production	artificialthinker.com	h1ULrdTohqt8_EKjfAyyafQFKFVbZ5CdKzb#!/bin/bash
+set -euo pipefail
+
+# Configuration
+export AWS_REGION="us-east-2"
+export AWS_ACCOUNT_ID="872515289083"
+export DOMAIN="artificialthinker.com"
+export CLUSTER="kaleidoscope-cluster"
+
+# Initialize system
+init_system() {
+    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+    # Create ECR repositories if they don't exist
+    for repo in quantum supernode kaleidoscope mirror; do
+        aws ecr describe-repositories --repository-names kaleidoscope/${repo} || \
+        aws ecr create-repository --repository-name kaleidoscope/${repo}
+    done
+}
+
+# Deploy infrastructure
+deploy_infra() {
+    cd infrastructure/terraform
+    terraform init
+    terraform apply -auto-approve
+    cd ../..
+}
+
+# Build and push images
+build_images() {
+    services=(quantum supernode kaleidoscope mirror)
+    for service in "${services[@]}"; do
+        docker build -f docker/Dockerfile.${service} \
+            -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/kaleidoscope/${service}:latest .
+        docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/kaleidoscope/${service}:latest
+    done
+}
+
+# Deploy services
+deploy_services() {
+    docker stack deploy -c docker-compose.final.yml kaleidoscope
+
+    # Wait for services to stabilize
+    for service in quantum supernode kaleidoscope mirror; do
+        aws ecs wait services-stable \
+            --cluster ${CLUSTER} \
+            --services ${service}
+    done
+}
+
+# Configure domain and SSL
+setup_domain() {
+    python3 -m domain_manager
+    systemctl restart nginx
+}
+
+# Start monitoring
+start_monitoring() {
+    kubectl apply -f monitoring/
+    kubectl rollout status deployment/prometheus -n monitoring
+    kubectl rollout status deployment/grafana -n monitoring
+}
+
+# Verify deployment
+verify_deployment() {
+    endpoints=(
+        "https://${DOMAIN}/health"
+        "https://api.${DOMAIN}/health"
+        "https://monitor.${DOMAIN}/health"
+    )
+
+    for endpoint in "${endpoints[@]}"; do
+        if ! curl -sSf "${endpoint}" >/dev/null; then
+            echo "Error: ${endpoint} is not responding"
+            exit 1
+        fi
+    done
+}
+
+# Main execution
+main() {
+    init_system
+    deploy_infra
+    build_images
+    deploy_services
+    setup_domain
+    start_monitoring
+    verify_deployment
+
+    echo "Kaleidoscope AI system successfully deployed to https://${DOMAIN}"
+}
+
+main "$@"
+

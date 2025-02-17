@@ -1,0 +1,13 @@
+node_base_memory: 500
+log_level: 'INFO'
+engine_max_buffer: 1024
+insight_threshold_ratio: 0.7
+node_dump_ratio: 0.4
+anomaly_iqr_multiplier: 1.5
+trend_prediction_lookback: 30
+scenario_clustering_n_clusters: 3
+weakness_feature_importance_threshold: 0.1
+max_phases: 2
+cpu_threads: 4
+batch_size: 32
+enable_mlk: true

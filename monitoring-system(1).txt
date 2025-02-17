@@ -1,0 +1,70 @@
+await self._store_metric('HTTP/ResponseTime', response_time)
+                        await self._store_metric('HTTP/Status', status)
+                        
+                        if response_time > self.config.threshold_response_time:
+                            await self._handle_warning('http', f'Response time ({response_time:.2f}s) exceeds threshold')
+                        
+                        if status != 200:
+                            await self._handle_error('http', f'Non-200 status code: {status}')
+                            
+                except Exception as e:
+                    self.logger.error(f"HTTP monitoring error: {e}")
+                    await self._handle_error('http', str(e))
+                    
+                await asyncio.sleep(self.config.check_interval)
+
+    async def _monitor_global_availability(self):
+        while True:
+            try:
+                results = await asyncio.gather(*[
+                    self._check_region_availability(region)
+                    for region in self.config.regions_to_check
+                ])
+                
+                availability = sum(1 for r in results if r['status'] == 'available') / len(results) * 100
+                self.metrics['global_availability'] = availability
+                
+                await self._store_metric('Global/Availability', availability)
+                
+                if availability < self.config.threshold_availability:
+                    await self._handle_warning('availability', 
+                        f'Global availability ({availability:.1f}%) below threshold')
+                    
+                # Store regional metrics
+                for result in results:
+                    await self._store_metric(
+                        'Regional/ResponseTime',
+                        result['response_time'],
+                        {'Region': result['region']}
+                    )
+                    
+            except Exception as e:
+                self.logger.error(f"Global availability monitoring error: {e}")
+                await self._handle_error('availability', str(e))
+                
+            await asyncio.sleep(self.config.check_interval * 2)
+
+    async def _check_region_availability(self, region: str) -> Dict:
+        start_time = time.time()
+        try:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+            async with session:
+                async with session.get(
+                    f'https://{self.config.domain}',
+                    headers={'X-Region-Check': region},
+                    ssl=self.ssl_context
+                ) as response:
+                    response_time = time.time() - start_time
+                    return {
+                        'region': region,
+                        'status': 'available' if response.status == 200 else 'error',
+                        'response_time': response_time,
+                        'status_code': response.status
+                    }
+        except Exception as e:
+            return {
+                'region': region,
+                'status': 'error',
+                'response_time': time.time() - start

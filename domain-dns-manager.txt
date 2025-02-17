@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+import asyncio
+import aiodns
+import boto3
+import json
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+import logging
+import uuid
+import aiohttp
+import ssl
+
+@dataclass
+class DNSRecord:
+    name: str
+    type: str
+    ttl: int
+    values: List[str]
+
+class DomainDNSManager:
+    def __init__(self, domain: str, region: str = "us-east-2"):
+        self.domain = domain
+        self.region = region
+        self.session = boto3.Session(region_name=region)
+        self.route53 = self.session.client('route53')
+        self.secrets = self.session.client('secretsmanager')
+        self.logger = self._setup_logger()
+        self.resolver = aiodns.DNSResolver()
+        self.ssl_context = self._create_ssl_context()
+        self.zone_id = None
+
+    def _setup_logger(self):
+        logger = logging.getLogger('DomainDNSManager')
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(handler)
+        return logger
+
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        return context
+
+    async def configure_domain_dns(self, alb_dns: str):
+        credentials = await self._get_godaddy_credentials()
+        self.zone_id = await self._create_hosted_zone()
+        
+        async with self._create_godaddy_session(credentials) as session:
+            nameservers = await self._get_route53_nameservers()
+            await self._update_godaddy_nameservers(session, nameservers)
+            await self._create_dns_records(alb_dns)
+            await self._verify_dns_propagation(nameservers)
+
+    async def _get_godaddy_credentials(self) -> Dict[str, str]:
+        try:
+            response = self.secrets.get_secret_value(
+                SecretId=f'kaleidoscope/godaddy/production'
+            )
+            return json.loads(response['SecretString'])
+        except Exception as e:
+            self.logger.error(f"Failed to get GoDaddy credentials: {e}")
+            raise
+
+    def _create_godaddy_session(self, credentials: Dict[str, str]) -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(
+            base_url="https://api.godaddy.com/v1",
+            headers={
+                'Authorization': f'sso-key {credentials["key"]}:{credentials["secret"]}',
+                'Content-Type': 'application/json'
+            },
+            connector=aiohttp.TCPConnector(ssl=self.ssl_context)
+        )
+
+    async def _create_hosted_zone(self) -> str:
+        try:
+            response = self.route53.create_hosted_zone(
+                Name=self.domain,
+                CallerReference=str(uuid.uuid4()),
+                HostedZoneConfig={
+                    'Comment': f'Managed by KaleidoscopeAI DNS Manager'
+                }
+            )
+            zone_id = response['HostedZone']['Id']
+            self.logger.info(f"Created Route53 hosted zone: {zone_id}")
+            return zone_id
+        except Exception as e:
+            self.logger.error(f"Failed to create hosted zone: {e}")
+            raise
+
+    async def _get_route53_nameservers(self) -> List[str]:
+        try:
+            response = self.route53.get_hosted_zone(Id=self.zone_id)
+            return response['DelegationSet']['NameServers']
+        except Exception as e:
+            self.logger.error(f"Failed to get Route53 nameservers: {e}")
+            raise
+
+    async def _update_godaddy_nameservers(self, session: aiohttp.ClientSession, nameservers: List[str]):
+        async with session.put(
+            f'/domains/{self.domain}',
+            json={'nameServers': nameservers},
+            ssl=self.ssl_context
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                self.logger.error(f"Failed to update nameservers: {error_text}")
+                raise Exception(f"Failed to update nameservers: {error_text}")
+            self.logger.info("Updated GoDaddy nameservers")
+
+    async def _create_dns_records(self, alb_dns: str):
+        records = [
+            {
+                'Action': 'UPSERT',
+                'ResourceRecordSet': {
+                    'Name': self.domain,
+                    'Type': 'A',
+                    'AliasTarget': {
+                        'HostedZoneId': 'Z35SXDOTRQ7X7K',  # us-east-2 ALB zone ID
+                        'DNSName': alb_dns,
+                        'EvaluateTargetHealth': True
+                    }
+                }
+            },
+            {
+                'Action': 'UPSERT',
+                'ResourceRecordSet': {
+                    'Name': f'www.{self.domain}',
+                    'Type': 'CNAME',
+                    'TTL': 300,
+                    'ResourceRecords': [{'Value': self.domain}]
+                }
+            },
+            {
+                'Action': 'UPSERT',
+                'ResourceRecordSet': {
+                    'Name': f'*.{self.domain}',
+                    'Type': 'CNAME',
+                    'TTL': 300,
+                    'ResourceRecords': [{'Value': self.domain}]
+                }
+            }
+        ]
+
+        try:
+            self.route53.change_resource_record_sets(
+                HostedZoneId=self.zone_id,
+                ChangeBatch={'Changes': records}
+            )
+            self.logger.info("Created DNS records")
+        except Exception as e:
+            self.logger.error(f"Failed to create DNS records: {e}")
+            raise
+
+    async def _verify_dns_propagation(self, nameservers: List[str]):
+        max_attempts = 30
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                for ns in nameservers:
+                    response = await self.resolver.query(self.domain, 'NS')
+                    if ns not in [str(rdata.host) for rdata in response]:
+                        raise Exception(f"Nameserver {ns} not found")
+                self.logger.info("DNS propagation verified")
+                return
+            except Exception as e:
+                attempt += 1
+                if attempt >= max_attempts:
+                    self.logger.error(f"DNS propagation verification failed: {e}")
+                    raise
+                await asyncio.sleep(10)
+
+    async def monitor_dns_health(self):
+        while True:
+            try:
+                response = await self.resolver.query(self.domain,

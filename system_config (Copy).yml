@@ -1,0 +1,26 @@
+system:
+  version: "1.0.0"
+  name: "Quantum Molecular System"
+
+paths:
+  data: "data/"
+  logs: "logs/"
+  results: "results/"
+  molecules: "data/molecules/"
+  temp: "data/temp/"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/system.log"
+
+molecular:
+  force_field: "MMFF94"
+  optimization_steps: 1000
+  convergence_threshold: 1e-6
+  energy_unit: "kJ/mol"
+
+output:
+  save_format: "json"
+  include_timestamps: true
+  compress_old_results: true

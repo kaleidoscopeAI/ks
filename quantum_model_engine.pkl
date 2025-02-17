@@ -1,0 +1,10 @@
+# dummy_model_creation.py
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+
+# Create a dummy RandomForest model (not trained on any meaningful data)
+dummy_model = RandomForestClassifier(random_state=42)
+
+# Save the dummy model
+joblib.dump(dummy_model, 'quantum_model.pkl')
+print("Dummy quantum_model.pkl created.")
